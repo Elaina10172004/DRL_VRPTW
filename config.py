@@ -66,6 +66,8 @@ class TrainDefaults:
     latent_adaptive_upscale: float = 1.10  # 停滞时放大倍率 / Sigma multiplier after stagnation
     latent_adaptive_patience: int = 1  # adaptive 停滞容忍轮数 / Patience before sigma upscale
     gate_init_bias: float = 2.0  # 解码门控初始偏置 / Initial bias of the decoder gate
+    use_residual_gate: bool = True  # 是否启用编码器残差分支门控 / Enable encoder residual branch gates
+    residual_gate_init_bias: float = 2.0  # 编码器残差分支门控初始偏置 / Initial bias for encoder residual gates
     diag_log_every: int = 100  # 训练诊断输出间隔 / Diagnostic print interval in updates
 
     vehicle_max: int | None = 25  # 车辆上限 / Vehicle upper bound

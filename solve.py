@@ -286,6 +286,8 @@ def _prepare_model_from_state(state, device: str, latent_dim: int | None, source
 
         use_raw_feature_bias=use_raw_feature_bias,
         latent_injection_mode=latent_injection_mode,
+        use_residual_gate=bool(getattr(train_defaults, "use_residual_gate", True)),
+        residual_gate_init_bias=float(getattr(train_defaults, "residual_gate_init_bias", 2.0)),
 
     )
 
@@ -1064,6 +1066,8 @@ def eas_adapt_on_instance(
         cand_phi_dim=cand_phi_dim,
         cand_phi_hidden_dim=cand_phi_hidden_dim,
         use_raw_feature_bias=bool(use_raw_feature_bias),
+        use_residual_gate=bool(getattr(train_defaults, "use_residual_gate", True)),
+        residual_gate_init_bias=float(getattr(train_defaults, "residual_gate_init_bias", 2.0)),
     )
 
     state_has_phi = _state_has_phi_proj(base_state)

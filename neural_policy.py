@@ -379,6 +379,8 @@ class GatedTransformerEncoderLayer(nn.Module):
         norm_first: bool = False,
         use_gated_attn: bool = True,
         gated_attn_init_bias: float = 2.0,
+        use_residual_gate: bool = True,
+        residual_gate_init_bias: float = 2.0,
     ):
         super().__init__()
         if activation != "relu":
@@ -401,6 +403,13 @@ class GatedTransformerEncoderLayer(nn.Module):
         self.dropout2 = nn.Dropout(dropout)
         self.use_gated_attn = bool(use_gated_attn)
         self.alpha_attn_gate = 1.0
+        self.use_residual_gate = bool(use_residual_gate)
+        self.residual_attn_gate = nn.Linear(d_model, 1)
+        self.residual_ffn_gate = nn.Linear(d_model, 1)
+        nn.init.zeros_(self.residual_attn_gate.weight)
+        nn.init.zeros_(self.residual_ffn_gate.weight)
+        nn.init.constant_(self.residual_attn_gate.bias, float(residual_gate_init_bias))
+        nn.init.constant_(self.residual_ffn_gate.bias, float(residual_gate_init_bias))
 
     def _sa_block(
         self,
@@ -432,6 +441,23 @@ class GatedTransformerEncoderLayer(nn.Module):
             )[0]
         return self.dropout1(x)
 
+    def _apply_residual_gate(
+        self,
+        gate_proj: nn.Linear,
+        gate_input: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not bool(getattr(self, "use_residual_gate", True)):
+            zero = residual.new_zeros(())
+            return residual, zero, zero
+        gate = torch.sigmoid(gate_proj(gate_input)).to(dtype=residual.dtype)
+        gated_residual = residual * gate
+        with torch.no_grad():
+            gate_f = gate.detach().float()
+            gate_mean = gate_f.mean()
+            gate_sparsity = (gate_f < 0.1).float().mean()
+        return gated_residual, gate_mean, gate_sparsity
+
     def forward(
         self,
         src: torch.Tensor,
@@ -440,19 +466,47 @@ class GatedTransformerEncoderLayer(nn.Module):
         is_causal: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         if self.norm_first:
-            src = src + self._sa_block(
-                self.norm1(src, src_key_padding_mask),
+            attn_in = self.norm1(src, src_key_padding_mask)
+            sa_residual = self._sa_block(
+                attn_in,
                 src_mask,
                 src_key_padding_mask,
                 is_causal=is_causal,
             )
-            src = src + self.dropout2(self.ffn(self.norm2(src, src_key_padding_mask)))
+            sa_residual, residual_gate_attn_mean, residual_gate_attn_sparsity = self._apply_residual_gate(
+                self.residual_attn_gate,
+                attn_in,
+                sa_residual,
+            )
+            src = src + sa_residual
+            ffn_in = self.norm2(src, src_key_padding_mask)
+            ffn_residual = self.dropout2(self.ffn(ffn_in))
+            ffn_residual, residual_gate_ffn_mean, residual_gate_ffn_sparsity = self._apply_residual_gate(
+                self.residual_ffn_gate,
+                ffn_in,
+                ffn_residual,
+            )
+            src = src + ffn_residual
         else:
+            attn_in = src
+            sa_residual = self._sa_block(attn_in, src_mask, src_key_padding_mask, is_causal=is_causal)
+            sa_residual, residual_gate_attn_mean, residual_gate_attn_sparsity = self._apply_residual_gate(
+                self.residual_attn_gate,
+                attn_in,
+                sa_residual,
+            )
             src = self.norm1(
-                src + self._sa_block(src, src_mask, src_key_padding_mask, is_causal=is_causal),
+                src + sa_residual,
                 src_key_padding_mask,
             )
-            src = self.norm2(src + self.dropout2(self.ffn(src)), src_key_padding_mask)
+            ffn_in = src
+            ffn_residual = self.dropout2(self.ffn(ffn_in))
+            ffn_residual, residual_gate_ffn_mean, residual_gate_ffn_sparsity = self._apply_residual_gate(
+                self.residual_ffn_gate,
+                ffn_in,
+                ffn_residual,
+            )
+            src = self.norm2(src + ffn_residual, src_key_padding_mask)
         stats = {
             "gated_attn_mean": (
                 self.self_attn.last_gated_attn_mean
@@ -464,6 +518,10 @@ class GatedTransformerEncoderLayer(nn.Module):
                 if (self.use_gated_attn and self.self_attn.last_gated_attn_sparsity is not None)
                 else src.new_zeros(())
             ),
+            "residual_gate_attn_mean": residual_gate_attn_mean,
+            "residual_gate_attn_sparsity": residual_gate_attn_sparsity,
+            "residual_gate_ffn_mean": residual_gate_ffn_mean,
+            "residual_gate_ffn_sparsity": residual_gate_ffn_sparsity,
         }
         return src, src.new_zeros(()), stats
 
@@ -475,6 +533,10 @@ class EncoderStack(nn.Module):
         self.num_layers = len(self.layers)
         self.last_gated_attn_mean: Optional[torch.Tensor] = None
         self.last_gated_attn_sparsity: Optional[torch.Tensor] = None
+        self.last_residual_gate_attn_mean: Optional[torch.Tensor] = None
+        self.last_residual_gate_attn_sparsity: Optional[torch.Tensor] = None
+        self.last_residual_gate_ffn_mean: Optional[torch.Tensor] = None
+        self.last_residual_gate_ffn_sparsity: Optional[torch.Tensor] = None
 
     def forward(
         self,
@@ -487,6 +549,10 @@ class EncoderStack(nn.Module):
         total_aux = src.new_zeros(())
         gated_mean_list: List[torch.Tensor] = []
         gated_sparsity_list: List[torch.Tensor] = []
+        residual_attn_mean_list: List[torch.Tensor] = []
+        residual_attn_sparsity_list: List[torch.Tensor] = []
+        residual_ffn_mean_list: List[torch.Tensor] = []
+        residual_ffn_sparsity_list: List[torch.Tensor] = []
         for layer in self.layers:
             out, aux_loss, layer_stats = layer(
                 out,
@@ -497,14 +563,50 @@ class EncoderStack(nn.Module):
             total_aux = total_aux + aux_loss
             gated_mean_list.append(layer_stats["gated_attn_mean"])
             gated_sparsity_list.append(layer_stats["gated_attn_sparsity"])
+            residual_attn_mean_list.append(layer_stats["residual_gate_attn_mean"])
+            residual_attn_sparsity_list.append(layer_stats["residual_gate_attn_sparsity"])
+            residual_ffn_mean_list.append(layer_stats["residual_gate_ffn_mean"])
+            residual_ffn_sparsity_list.append(layer_stats["residual_gate_ffn_sparsity"])
         self.last_gated_attn_mean = torch.stack(gated_mean_list, dim=0) if gated_mean_list else None
         self.last_gated_attn_sparsity = torch.stack(gated_sparsity_list, dim=0) if gated_sparsity_list else None
+        self.last_residual_gate_attn_mean = (
+            torch.stack(residual_attn_mean_list, dim=0) if residual_attn_mean_list else None
+        )
+        self.last_residual_gate_attn_sparsity = (
+            torch.stack(residual_attn_sparsity_list, dim=0) if residual_attn_sparsity_list else None
+        )
+        self.last_residual_gate_ffn_mean = (
+            torch.stack(residual_ffn_mean_list, dim=0) if residual_ffn_mean_list else None
+        )
+        self.last_residual_gate_ffn_sparsity = (
+            torch.stack(residual_ffn_sparsity_list, dim=0) if residual_ffn_sparsity_list else None
+        )
         stats = {
             "gated_attn_mean": (
                 self.last_gated_attn_mean if self.last_gated_attn_mean is not None else out.new_zeros(())
             ),
             "gated_attn_sparsity": (
                 self.last_gated_attn_sparsity if self.last_gated_attn_sparsity is not None else out.new_zeros(())
+            ),
+            "residual_gate_attn_mean": (
+                self.last_residual_gate_attn_mean
+                if self.last_residual_gate_attn_mean is not None
+                else out.new_zeros(())
+            ),
+            "residual_gate_attn_sparsity": (
+                self.last_residual_gate_attn_sparsity
+                if self.last_residual_gate_attn_sparsity is not None
+                else out.new_zeros(())
+            ),
+            "residual_gate_ffn_mean": (
+                self.last_residual_gate_ffn_mean
+                if self.last_residual_gate_ffn_mean is not None
+                else out.new_zeros(())
+            ),
+            "residual_gate_ffn_sparsity": (
+                self.last_residual_gate_ffn_sparsity
+                if self.last_residual_gate_ffn_sparsity is not None
+                else out.new_zeros(())
             ),
         }
         return out, total_aux / max(1, self.num_layers), stats
@@ -1251,6 +1353,8 @@ class AttentionVRPTW(nn.Module):
         latent_injection_mode: str = "film",
         use_gated_attn: bool = True,
         gated_attn_init_bias: float = 2.0,
+        use_residual_gate: bool = True,
+        residual_gate_init_bias: float = 2.0,
     ):
         super().__init__()
         if node_dim is None:
@@ -1272,6 +1376,8 @@ class AttentionVRPTW(nn.Module):
         self.cand_phi_hidden_dim = max(0, int(cand_phi_hidden_dim))
         self.use_raw_feature_bias = bool(use_raw_feature_bias)
         self.alpha_attn_gate: Optional[float] = None
+        self.use_residual_gate = bool(use_residual_gate)
+        self.residual_gate_init_bias = float(residual_gate_init_bias)
 
         self.node_dim = int(node_dim)
         self.node_enc = nn.Linear(self.node_dim, embed_dim)
@@ -1286,6 +1392,8 @@ class AttentionVRPTW(nn.Module):
             activation="relu",
             use_gated_attn=use_gated_attn,
             gated_attn_init_bias=gated_attn_init_bias,
+            use_residual_gate=use_residual_gate,
+            residual_gate_init_bias=residual_gate_init_bias,
         )
         self.encoder = EncoderStack(enc_layer, num_layers=n_layers)
 
@@ -1380,6 +1488,9 @@ class AttentionVRPTW(nn.Module):
         if model_alpha_attn_gate is not None and hasattr(self.encoder, "layers"):
             for enc_layer in self.encoder.layers:
                 setattr(enc_layer, "alpha_attn_gate", float(model_alpha_attn_gate))
+        if hasattr(self.encoder, "layers"):
+            for enc_layer in self.encoder.layers:
+                setattr(enc_layer, "use_residual_gate", bool(getattr(self, "use_residual_gate", True)))
         node_emb, aux_loss, enc_stats = self.encoder(
             node_emb,
             src_key_padding_mask=key_padding_mask,
@@ -2326,6 +2437,8 @@ def train_neural(
         cand_phi_dim=cand_phi_dim,
         cand_phi_hidden_dim=cand_phi_hidden_dim,
         use_raw_feature_bias=use_raw_feature_bias,
+        use_residual_gate=bool(getattr(train_defaults, "use_residual_gate", True)),
+        residual_gate_init_bias=float(getattr(train_defaults, "residual_gate_init_bias", 2.0)),
     ).to(device)
     use_bf16 = resolve_bf16_mode(device, use_bf16, scope="train", verbose=True)
     if use_bf16:
@@ -2606,6 +2719,8 @@ def neural_construct_single(
             cand_phi_dim=cand_phi_dim,
             cand_phi_hidden_dim=cand_phi_hidden_dim,
             use_raw_feature_bias=use_raw_feature_bias,
+            use_residual_gate=bool(getattr(train_defaults, "use_residual_gate", True)),
+            residual_gate_init_bias=float(getattr(train_defaults, "residual_gate_init_bias", 2.0)),
         ).to(device)
     target_node_dim = int(getattr(getattr(model, "node_enc", None), "in_features", node_feats.size(-1)))
     node_feats, depot_feat = _match_model_node_feat_dim(node_feats, depot_feat, target_node_dim)
@@ -2744,6 +2859,8 @@ def neural_construct(
             cand_phi_dim=cand_phi_dim,
             cand_phi_hidden_dim=cand_phi_hidden_dim,
             use_raw_feature_bias=use_raw_feature_bias,
+            use_residual_gate=bool(getattr(train_defaults, "use_residual_gate", True)),
+            residual_gate_init_bias=float(getattr(train_defaults, "residual_gate_init_bias", 2.0)),
         ).to(device)
     target_node_dim = int(getattr(getattr(model, "node_enc", None), "in_features", all_node_feats.size(-1)))
     all_node_feats, all_depot_feats = _match_model_node_feat_dim(all_node_feats, all_depot_feats, target_node_dim)
@@ -3217,6 +3334,63 @@ def self_test_gated_encoder_attention(device: Optional[str] = None):
     if torch.cuda.is_available():
         _run_once(torch.float16, use_gated_attn=True, alpha_attn_gate=1.0)
         _run_once(torch.bfloat16, use_gated_attn=True, alpha_attn_gate=1.0)
+
+
+def self_test_residual_gated_encoder(device: Optional[str] = None):
+    """
+    Minimal sanity check for encoder residual branch gates:
+    1) use_residual_gate=False: shape is correct, output has no NaN, residual stats are zeros.
+    2) use_residual_gate=True: shape is correct, output has no NaN, gate means are in (0, 1).
+    Runs on both post-norm and pre-norm paths.
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    def _run_once(dtype: torch.dtype, use_residual_gate: bool, norm_first: bool):
+        layer = GatedTransformerEncoderLayer(
+            d_model=32,
+            nhead=4,
+            dim_feedforward=64,
+            dropout=0.0,
+            batch_first=True,
+            norm_first=norm_first,
+            use_gated_attn=True,
+            gated_attn_init_bias=2.0,
+            use_residual_gate=use_residual_gate,
+            residual_gate_init_bias=2.0,
+        ).to(device=device, dtype=dtype)
+        layer.eval()
+
+        src = torch.randn(3, 11, 32, device=device, dtype=dtype)
+        with torch.no_grad():
+            out, _aux_loss, stats = layer(src, src_mask=None, src_key_padding_mask=None)
+        assert out.shape == src.shape, "shape mismatch in residual-gated encoder output"
+        assert out.device == src.device, "device mismatch in residual-gated encoder output"
+        assert out.dtype == src.dtype, "dtype mismatch in residual-gated encoder output"
+        assert torch.isfinite(out).all(), "non-finite values found in residual-gated encoder output"
+
+        attn_mean = float(stats["residual_gate_attn_mean"].detach().float().item())
+        ffn_mean = float(stats["residual_gate_ffn_mean"].detach().float().item())
+        attn_sparsity = float(stats["residual_gate_attn_sparsity"].detach().float().item())
+        ffn_sparsity = float(stats["residual_gate_ffn_sparsity"].detach().float().item())
+        if use_residual_gate:
+            assert 0.0 < attn_mean < 1.0, f"residual_gate_attn_mean is out of range: {attn_mean}"
+            assert 0.0 < ffn_mean < 1.0, f"residual_gate_ffn_mean is out of range: {ffn_mean}"
+            assert 0.0 <= attn_sparsity <= 1.0, f"residual_gate_attn_sparsity out of range: {attn_sparsity}"
+            assert 0.0 <= ffn_sparsity <= 1.0, f"residual_gate_ffn_sparsity out of range: {ffn_sparsity}"
+        else:
+            assert attn_mean == 0.0, f"expected residual_gate_attn_mean=0, got {attn_mean}"
+            assert ffn_mean == 0.0, f"expected residual_gate_ffn_mean=0, got {ffn_mean}"
+            assert attn_sparsity == 0.0, f"expected residual_gate_attn_sparsity=0, got {attn_sparsity}"
+            assert ffn_sparsity == 0.0, f"expected residual_gate_ffn_sparsity=0, got {ffn_sparsity}"
+
+    for norm_first in (False, True):
+        _run_once(torch.float32, use_residual_gate=False, norm_first=norm_first)
+        _run_once(torch.float32, use_residual_gate=True, norm_first=norm_first)
+
+    if torch.cuda.is_available():
+        _run_once(torch.float16, use_residual_gate=True, norm_first=False)
+        _run_once(torch.bfloat16, use_residual_gate=True, norm_first=True)
 
 
 def _smoke_test_head_gated_mha(device: Optional[str] = None):

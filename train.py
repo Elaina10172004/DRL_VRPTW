@@ -500,6 +500,25 @@ def train():
         action="store_false",
         help="Disable explicit raw static-feature bias head.",
     )
+    ap.add_argument(
+        "--use_residual_gate",
+        dest="use_residual_gate",
+        action="store_true",
+        default=bool(getattr(train_defaults, "use_residual_gate", True)),
+        help="Enable encoder residual branch gates.",
+    )
+    ap.add_argument(
+        "--no_residual_gate",
+        dest="use_residual_gate",
+        action="store_false",
+        help="Disable encoder residual branch gates.",
+    )
+    ap.add_argument(
+        "--residual_gate_init_bias",
+        type=float,
+        default=float(getattr(train_defaults, "residual_gate_init_bias", 2.0)),
+        help="Initial bias for encoder residual branch gates.",
+    )
     args = ap.parse_args()
     train_defaults.use_train_shards = bool(args.use_train_shards)
     train_defaults.train_shards_dir = args.train_shards_dir
@@ -518,6 +537,8 @@ def train():
     train_defaults.use_greedy_start_pool = bool(args.use_greedy_start_pool)
     train_defaults.use_dynamic_key_aug = bool(args.use_dynamic_key_aug)
     train_defaults.use_raw_feature_bias = bool(args.use_raw_feature_bias)
+    train_defaults.use_residual_gate = bool(args.use_residual_gate)
+    train_defaults.residual_gate_init_bias = float(args.residual_gate_init_bias)
 
     training_base_instances: list[Instance] = []
     if args.use_train_folder and args.train_folder is not None:
