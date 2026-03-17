@@ -108,6 +108,67 @@ class FeedForwardBlock(nn.Module):
         return self.lin2(F.relu(self.lin1(x)))
 
 
+class POMOInstanceNorm(nn.Module):
+    """
+    POMO-style instance norm on sequence embeddings.
+    Input/Output shape: [B, N, E] (batch_first=True) or [N, B, E] (batch_first=False).
+    """
+
+    def __init__(self, d_model: int, eps: float = 1e-5, batch_first: bool = True):
+        super().__init__()
+        self.eps = float(eps)
+        self.batch_first = bool(batch_first)
+        self.weight = nn.Parameter(torch.ones(int(d_model)))
+        self.bias = nn.Parameter(torch.zeros(int(d_model)))
+
+    def forward(self, x: torch.Tensor, padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if x.dim() != 3:
+            raise ValueError(f"POMOInstanceNorm expects a 3D tensor, got shape={tuple(x.shape)}")
+
+        x_bne = x if self.batch_first else x.transpose(0, 1)
+
+        if padding_mask is None:
+            # Strict POMO path: transpose to [B, E, N], instance-normalize, transpose back.
+            weight = self.weight.to(dtype=x_bne.dtype, device=x_bne.device)
+            bias = self.bias.to(dtype=x_bne.dtype, device=x_bne.device)
+            out = F.instance_norm(
+                x_bne.transpose(1, 2),
+                running_mean=None,
+                running_var=None,
+                weight=weight,
+                bias=bias,
+                use_input_stats=True,
+                momentum=0.1,
+                eps=self.eps,
+            ).transpose(1, 2)
+        else:
+            if padding_mask.dim() != 2:
+                raise ValueError(f"padding_mask must be [B,N], got shape={tuple(padding_mask.shape)}")
+            if padding_mask.size(0) != x_bne.size(0) or padding_mask.size(1) != x_bne.size(1):
+                raise ValueError(
+                    f"padding_mask shape mismatch: mask={tuple(padding_mask.shape)}, input={tuple(x_bne.shape)}"
+                )
+
+            valid = (~padding_mask.to(device=x_bne.device, dtype=torch.bool)).to(dtype=x_bne.dtype).unsqueeze(-1)
+            valid_count = valid.sum(dim=1, keepdim=True).clamp_min(1.0)
+
+            mean = (x_bne * valid).sum(dim=1, keepdim=True) / valid_count
+            centered = (x_bne - mean) * valid
+            var = (centered * centered).sum(dim=1, keepdim=True) / valid_count
+            inv_std = torch.rsqrt(var + self.eps)
+
+            out = centered * inv_std
+            weight = self.weight.to(dtype=x_bne.dtype, device=x_bne.device).view(1, 1, -1)
+            bias = self.bias.to(dtype=x_bne.dtype, device=x_bne.device).view(1, 1, -1)
+            out = out * weight + bias
+            # Keep padded tokens neutral so they do not leak into following layers.
+            out = out * valid
+
+        if not self.batch_first:
+            out = out.transpose(0, 1)
+        return out
+
+
 class HeadGatedMultiheadAttention(nn.MultiheadAttention):
     def __init__(
         self,
@@ -334,8 +395,8 @@ class GatedTransformerEncoderLayer(nn.Module):
         )
         self.ffn = FeedForwardBlock(embed_dim=d_model, ff_dim=dim_feedforward)
         self.norm_first = bool(norm_first)
-        self.norm1 = nn.LayerNorm(d_model, eps=layer_norm_eps)
-        self.norm2 = nn.LayerNorm(d_model, eps=layer_norm_eps)
+        self.norm1 = POMOInstanceNorm(d_model, eps=layer_norm_eps, batch_first=batch_first)
+        self.norm2 = POMOInstanceNorm(d_model, eps=layer_norm_eps, batch_first=batch_first)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.use_gated_attn = bool(use_gated_attn)
@@ -379,11 +440,19 @@ class GatedTransformerEncoderLayer(nn.Module):
         is_causal: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         if self.norm_first:
-            src = src + self._sa_block(self.norm1(src), src_mask, src_key_padding_mask, is_causal=is_causal)
-            src = src + self.dropout2(self.ffn(self.norm2(src)))
+            src = src + self._sa_block(
+                self.norm1(src, src_key_padding_mask),
+                src_mask,
+                src_key_padding_mask,
+                is_causal=is_causal,
+            )
+            src = src + self.dropout2(self.ffn(self.norm2(src, src_key_padding_mask)))
         else:
-            src = self.norm1(src + self._sa_block(src, src_mask, src_key_padding_mask, is_causal=is_causal))
-            src = self.norm2(src + self.dropout2(self.ffn(src)))
+            src = self.norm1(
+                src + self._sa_block(src, src_mask, src_key_padding_mask, is_causal=is_causal),
+                src_key_padding_mask,
+            )
+            src = self.norm2(src + self.dropout2(self.ffn(src)), src_key_padding_mask)
         stats = {
             "gated_attn_mean": (
                 self.self_attn.last_gated_attn_mean
@@ -3004,6 +3073,71 @@ def _apply_feasibility_mask(
         refined[zero_rows] = 0.0
         refined[zero_rows, env.N] = 1.0
     return refined
+
+
+def self_test_pomo_instance_norm_equivalence_no_pad(device: Optional[str] = None):
+    """
+    Verify the no-pad path matches original POMO transpose+InstanceNorm1d behavior.
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    torch.manual_seed(0)
+    B, N, E = 4, 13, 32
+    x = torch.randn(B, N, E, device=device, dtype=torch.float32)
+
+    norm = POMOInstanceNorm(d_model=E, eps=1e-5, batch_first=True).to(device=device, dtype=x.dtype)
+    ref_norm = nn.InstanceNorm1d(E, affine=True, track_running_stats=False, eps=1e-5).to(device=device, dtype=x.dtype)
+
+    with torch.no_grad():
+        ref_norm.weight.copy_(norm.weight)
+        ref_norm.bias.copy_(norm.bias)
+
+        out = norm(x, padding_mask=None)
+        out_ref = ref_norm(x.transpose(1, 2)).transpose(1, 2)
+        max_abs = float((out - out_ref).abs().max().item())
+        assert max_abs < 1e-6, f"POMOInstanceNorm no-pad mismatch, max_abs_diff={max_abs:.6e}"
+
+        norm_t = POMOInstanceNorm(d_model=E, eps=1e-5, batch_first=False).to(device=device, dtype=x.dtype)
+        norm_t.weight.copy_(norm.weight)
+        norm_t.bias.copy_(norm.bias)
+        out_t = norm_t(x.transpose(0, 1), padding_mask=None).transpose(0, 1)
+        max_abs_t = float((out_t - out_ref).abs().max().item())
+        assert max_abs_t < 1e-6, f"POMOInstanceNorm batch_first=False mismatch, max_abs_diff={max_abs_t:.6e}"
+
+
+def self_test_encoder_norm_checkpoint_compat(device: Optional[str] = None):
+    """
+    Ensure encoder norm keys stay strict-load compatible for legacy checkpoints.
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    torch.manual_seed(0)
+    node_dim = get_planned_node_feature_dim()
+    model_src = AttentionVRPTW(node_dim=node_dim, embed_dim=32, n_heads=4, n_layers=2).to(device)
+    state = model_src.state_dict()
+
+    norm_suffixes = (".norm1.weight", ".norm1.bias", ".norm2.weight", ".norm2.bias")
+    norm_keys = [k for k in state.keys() if k.startswith("encoder.layers.") and k.endswith(norm_suffixes)]
+    assert norm_keys, "No encoder norm keys found for compatibility self-test."
+
+    with torch.no_grad():
+        for idx, key in enumerate(sorted(norm_keys)):
+            numel = state[key].numel()
+            shape = state[key].shape
+            base = torch.linspace(-0.5, 0.5, steps=numel, device=state[key].device, dtype=state[key].dtype)
+            if key.endswith("bias"):
+                base = -base
+            state[key] = (base + 0.01 * idx).view(shape)
+
+    model_dst = AttentionVRPTW(node_dim=node_dim, embed_dim=32, n_heads=4, n_layers=2).to(device)
+    model_dst.load_state_dict(state, strict=True)
+    loaded_state = model_dst.state_dict()
+
+    for key in norm_keys:
+        if not torch.allclose(loaded_state[key], state[key], atol=0.0, rtol=0.0):
+            raise AssertionError(f"Norm compatibility load mismatch at key: {key}")
 
 
 def self_test_encode_padding_invariance(device: str = "cpu"):
