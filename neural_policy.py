@@ -3125,40 +3125,25 @@ def compute_advantage(
     ema_state: EMAState,
     eps: float = 1e-8,
 ):
+    del eps
     uniq, inverse = torch.unique(group_ids, return_inverse=True)
     group_count = torch.zeros(len(uniq), device=reward.device, dtype=reward.dtype)
     group_sum = torch.zeros(len(uniq), device=reward.device, dtype=reward.dtype)
     ones = torch.ones_like(reward, dtype=reward.dtype)
     group_count.scatter_add_(0, inverse, ones)
     group_sum.scatter_add_(0, inverse, reward)
-    # Leave-one-out group baseline:
-    # for sample i in a group, baseline excludes reward_i itself.
-    group_count_i = group_count[inverse]
-    group_sum_i = group_sum[inverse]
-    has_peer = group_count_i > 1.0
-    loo_group_mean = torch.where(
-        has_peer,
-        (group_sum_i - reward) / (group_count_i - 1.0),
-        reward,
-    )
-    a0 = reward - loo_group_mean
-    raw_adv_std = float(a0.std(unbiased=False).item())
-    batch_mean = a0.mean()
-    batch_std = a0.std(unbiased=False) + eps
-    a_norm = (a0 - batch_mean) / batch_std
-
-    ema_mean, ema_std = ema_state.update(batch_mean.detach(), batch_std.detach())
-    adv = (a_norm - ema_mean) / (ema_std + eps)
+    group_count_i = group_count[inverse].clamp_min(1.0)
+    group_mean = group_sum[inverse] / group_count_i
+    adv = reward - group_mean
 
     stats = {
-        "adv_mode": "group_mean_only",
-        "var_a1": float(a0.var(unbiased=False).item()),
-        "loo_singleton_ratio": float((~has_peer).float().mean().item()),
-        "batch_mean_a0": float(batch_mean.item()),
-        "batch_std_a0": float(batch_std.item()),
-        "ema_mean": float(ema_mean.item()),
-        "ema_std": float(ema_std.item()),
-        "adv_raw_std": raw_adv_std,
+        "adv_mode": "reward_minus_group_mean",
+        "baseline_mean": float(group_mean.mean().item()),
+        "baseline_std": float(group_mean.std(unbiased=False).item()) if group_mean.numel() > 1 else 0.0,
+        "adv_mean": float(adv.mean().item()),
+        "adv_std": float(adv.std(unbiased=False).item()) if adv.numel() > 1 else 0.0,
+        "reward_mean": float(reward.mean().item()),
+        "reward_std": float(reward.std(unbiased=False).item()) if reward.numel() > 1 else 0.0,
     }
 
     return adv, ema_state, stats
@@ -3417,6 +3402,24 @@ def self_test_depth_attn_residual_behavior(device: Optional[str] = None):
         out_large = depth_res(hist_large, padding_mask=mask_large)
         pad_free_diff = float((out_small[:, :valid_n] - out_large[:, :valid_n]).abs().max().item())
         assert pad_free_diff < 1e-6, f"DepthAttnResidual padding sensitivity, max_abs_diff={pad_free_diff:.6e}"
+
+
+def self_test_reward_baseline_advantage(device: Optional[str] = None):
+    """
+    Verify compute_advantage returns plain reward minus group mean, without z-scoring.
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    reward = torch.tensor([1.0, 2.0, 3.0, 10.0, 20.0], device=device)
+    group_ids = torch.tensor([0, 0, 0, 1, 1], device=device)
+    adv, _ema_state, stats = compute_advantage(reward, group_ids, EMAState(beta=0.9))
+
+    expected = torch.tensor([-1.0, 0.0, 1.0, -5.0, 5.0], device=device)
+    max_abs = float((adv - expected).abs().max().item())
+    assert max_abs < 1e-6, f"reward-baseline advantage mismatch, max_abs_diff={max_abs:.6e}"
+    assert stats.get("adv_mode") == "reward_minus_group_mean", f"unexpected adv_mode: {stats.get('adv_mode')}"
+    assert abs(float(stats["adv_mean"])) < 1e-6, "adv should be centered within each group"
 
 
 def _smoke_test_head_gated_mha(device: Optional[str] = None):
