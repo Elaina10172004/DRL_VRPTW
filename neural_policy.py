@@ -468,13 +468,110 @@ class GatedTransformerEncoderLayer(nn.Module):
         return src, src.new_zeros(()), stats
 
 
+class DepthAttnResidual(nn.Module):
+    """
+    Depth-wise residual routing over historical layer states.
+    History states are normalized with POMO instance stats, scored by a learned query,
+    then mixed with softmax over depth.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        layer_norm_eps: float = 1e-5,
+        batch_first: bool = True,
+    ):
+        super().__init__()
+        self.batch_first = bool(batch_first)
+        self.norm = POMOInstanceNorm(d_model=d_model, eps=layer_norm_eps, batch_first=batch_first)
+        self.depth_query = nn.Parameter(torch.zeros(int(d_model)))
+        self.depth_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        self.last_depth_weight_mean: Optional[torch.Tensor] = None
+
+    def _to_bne(self, x: torch.Tensor) -> torch.Tensor:
+        return x if self.batch_first else x.transpose(0, 1)
+
+    def _from_bne(self, x: torch.Tensor) -> torch.Tensor:
+        return x if self.batch_first else x.transpose(0, 1)
+
+    def forward(
+        self,
+        states: List[torch.Tensor],
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if len(states) <= 0:
+            raise ValueError("DepthAttnResidual requires at least one history state.")
+
+        ref = states[-1]
+        ref_bne = self._to_bne(ref)
+        if ref_bne.dim() != 3:
+            raise ValueError(f"DepthAttnResidual expects 3D states, got shape={tuple(ref.shape)}")
+        bsz, n_token, d_model = ref_bne.shape
+
+        pm_bool: Optional[torch.Tensor] = None
+        if padding_mask is not None:
+            if padding_mask.dim() != 2:
+                raise ValueError(f"padding_mask must be [B,N], got shape={tuple(padding_mask.shape)}")
+            if padding_mask.size(0) != bsz or padding_mask.size(1) != n_token:
+                raise ValueError(
+                    f"padding_mask shape mismatch: mask={tuple(padding_mask.shape)}, expected={(bsz, n_token)}"
+                )
+            pm_bool = padding_mask.to(device=ref_bne.device, dtype=torch.bool)
+
+        norm_states_bne: List[torch.Tensor] = []
+        value_states_bne: List[torch.Tensor] = []
+        for idx, state in enumerate(states):
+            if state.shape != ref.shape:
+                raise ValueError(
+                    f"All history states must share shape. states[{idx}]={tuple(state.shape)} vs ref={tuple(ref.shape)}"
+                )
+            norm_state = self.norm(state, padding_mask=pm_bool)
+            norm_state_bne = self._to_bne(norm_state)
+            value_state_bne = self._to_bne(state)
+            norm_states_bne.append(norm_state_bne)
+            value_states_bne.append(value_state_bne)
+
+        q = self.depth_query.to(device=ref_bne.device, dtype=ref_bne.dtype).view(1, 1, d_model)
+        scale = self.depth_scale.to(device=ref_bne.device, dtype=ref_bne.dtype)
+        logits = torch.stack([(s * q).sum(dim=-1) * scale for s in norm_states_bne], dim=1)  # [B,D,N]
+        weights = F.softmax(logits, dim=1)
+
+        if pm_bool is not None:
+            valid = (~pm_bool).to(dtype=weights.dtype, device=weights.device)
+            weights = weights * valid.unsqueeze(1)
+        values = torch.stack(value_states_bne, dim=1)  # [B,D,N,E]
+        out_bne = (weights.unsqueeze(-1) * values).sum(dim=1)
+
+        if pm_bool is not None:
+            valid = (~pm_bool).to(dtype=out_bne.dtype, device=out_bne.device).unsqueeze(-1)
+            out_bne = out_bne * valid
+
+        with torch.no_grad():
+            self.last_depth_weight_mean = weights.detach().float().mean()
+        return self._from_bne(out_bne)
+
+
 class EncoderStack(nn.Module):
     def __init__(self, encoder_layer: GatedTransformerEncoderLayer, num_layers: int):
         super().__init__()
         self.layers = nn.ModuleList([copy.deepcopy(encoder_layer) for _ in range(max(1, int(num_layers)))])
         self.num_layers = len(self.layers)
+        d_model = int(encoder_layer.self_attn.embed_dim)
+        batch_first = bool(getattr(encoder_layer.self_attn, "batch_first", True))
+        layer_norm_eps = float(getattr(encoder_layer.norm1, "eps", 1e-5))
+        self.depth_residuals = nn.ModuleList(
+            [
+                DepthAttnResidual(
+                    d_model=d_model,
+                    layer_norm_eps=layer_norm_eps,
+                    batch_first=batch_first,
+                )
+                for _ in range(max(0, self.num_layers - 1))
+            ]
+        )
         self.last_gated_attn_mean: Optional[torch.Tensor] = None
         self.last_gated_attn_sparsity: Optional[torch.Tensor] = None
+        self.last_depth_attn_mean: Optional[torch.Tensor] = None
 
     def forward(
         self,
@@ -484,27 +581,49 @@ class EncoderStack(nn.Module):
         is_causal: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         out = src
+        valid_mask: Optional[torch.Tensor] = None
+        if src_key_padding_mask is not None:
+            valid_mask = (~src_key_padding_mask.to(device=out.device, dtype=torch.bool)).to(dtype=out.dtype).unsqueeze(-1)
+            out = out * valid_mask
+        history: List[torch.Tensor] = [out]
         total_aux = src.new_zeros(())
         gated_mean_list: List[torch.Tensor] = []
         gated_sparsity_list: List[torch.Tensor] = []
-        for layer in self.layers:
+        depth_mean_list: List[torch.Tensor] = []
+        for idx, layer in enumerate(self.layers):
+            # The first encoder layer sees the stem directly; depth routing starts from layer 2
+            # to avoid a one-state AttnRes module with dead parameters.
+            if idx == 0 or len(self.depth_residuals) == 0:
+                x_in = out
+            else:
+                x_in = self.depth_residuals[idx - 1](history, padding_mask=src_key_padding_mask)
+                depth_mean = getattr(self.depth_residuals[idx - 1], "last_depth_weight_mean", None)
+                if depth_mean is not None:
+                    depth_mean_list.append(depth_mean)
             out, aux_loss, layer_stats = layer(
-                out,
+                x_in,
                 src_mask=mask,
                 src_key_padding_mask=src_key_padding_mask,
                 is_causal=is_causal,
             )
+            if valid_mask is not None:
+                out = out * valid_mask
             total_aux = total_aux + aux_loss
             gated_mean_list.append(layer_stats["gated_attn_mean"])
             gated_sparsity_list.append(layer_stats["gated_attn_sparsity"])
+            history.append(out)
         self.last_gated_attn_mean = torch.stack(gated_mean_list, dim=0) if gated_mean_list else None
         self.last_gated_attn_sparsity = torch.stack(gated_sparsity_list, dim=0) if gated_sparsity_list else None
+        self.last_depth_attn_mean = torch.stack(depth_mean_list, dim=0) if depth_mean_list else None
         stats = {
             "gated_attn_mean": (
                 self.last_gated_attn_mean if self.last_gated_attn_mean is not None else out.new_zeros(())
             ),
             "gated_attn_sparsity": (
                 self.last_gated_attn_sparsity if self.last_gated_attn_sparsity is not None else out.new_zeros(())
+            ),
+            "depth_attn_mean": (
+                self.last_depth_attn_mean if self.last_depth_attn_mean is not None else out.new_zeros(())
             ),
         }
         return out, total_aux / max(1, self.num_layers), stats
@@ -1674,6 +1793,12 @@ def three_phase_schedule(
     phase1_end: float = 0.2,
     phase2_end: float = 0.6,
 ):
+    """
+    Returns (sigma, entropy_coef, alpha_gate_schedule).
+    The same alpha value is used for both:
+    - decoder logit gate blend (`model.alpha_gate`)
+    - encoder gated-attention blend (`model.alpha_attn_gate`)
+    """
     x = epoch / float(max(total_epochs, 1))
     if x <= phase1_end:
         sigma = sigma_0
@@ -1690,6 +1815,14 @@ def three_phase_schedule(
         ent = ent_mid + t * (ent_min - ent_mid)
         alpha_gate = gate_mid + t * (1.0 - gate_mid)
     return float(sigma), float(ent), float(alpha_gate)
+
+
+def _set_model_gate_alphas(model: nn.Module, alpha_gate: float) -> float:
+    alpha = float(alpha_gate)
+    # Keep decoder and encoder gate schedules aligned.
+    setattr(model, "alpha_gate", alpha)
+    setattr(model, "alpha_attn_gate", alpha)
+    return alpha
 
 
 def alpha_schedule(progress: float, alpha_start: float = 350.0, alpha_end: float = 250.0, warmup_pct: float = 0.3) -> float:
@@ -2464,7 +2597,7 @@ def train_neural(
                 latent_sigma = float(scheduled_sigma)
             epoch_last_latent_sigma = float(latent_sigma)
             entropy_coef = entropy_coef_s
-            setattr(model, "alpha_gate", float(alpha_gate))
+            alpha_gate = _set_model_gate_alphas(model, alpha_gate)
             progress_in_epoch = (batch_idx / max(1, epoch_batches))
             progress = (epoch + progress_in_epoch) / float(max(1, total_epochs))
             (global_update, loss_item, mean_cost, mean_dist, mean_veh, grad_norm, step_entropy, ema_state, batch_stats) = train_one_batch(
@@ -3217,6 +3350,73 @@ def self_test_gated_encoder_attention(device: Optional[str] = None):
     if torch.cuda.is_available():
         _run_once(torch.float16, use_gated_attn=True, alpha_attn_gate=1.0)
         _run_once(torch.bfloat16, use_gated_attn=True, alpha_attn_gate=1.0)
+
+
+def self_test_gate_schedule_wiring(device: Optional[str] = None):
+    """
+    Ensure schedule wiring updates both decoder and encoder gate controls.
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    torch.manual_seed(0)
+    node_dim = get_planned_node_feature_dim()
+    model = AttentionVRPTW(node_dim=node_dim, embed_dim=32, n_heads=4, n_layers=2).to(device)
+    model.eval()
+
+    alpha = _set_model_gate_alphas(model, 0.37)
+    assert abs(float(getattr(model, "alpha_gate", -1.0)) - alpha) < 1e-12
+    assert abs(float(getattr(model, "alpha_attn_gate", -1.0)) - alpha) < 1e-12
+
+    with torch.no_grad():
+        nf = torch.randn(2, 9, node_dim, device=device)
+        df = torch.randn(2, node_dim, device=device)
+        pm = torch.ones(2, 9, device=device)
+        model.encode(nf, df, pm)
+
+    for idx, enc_layer in enumerate(model.encoder.layers):
+        layer_alpha = float(getattr(enc_layer, "alpha_attn_gate", -1.0))
+        assert abs(layer_alpha - alpha) < 1e-12, f"encoder layer {idx} alpha_attn_gate mismatch: {layer_alpha}"
+
+
+def self_test_depth_attn_residual_behavior(device: Optional[str] = None):
+    """
+    Check that depth residuals:
+    - reduce to a mean when the depth query is zeroed
+    - ignore extra padding tokens in the history
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    torch.manual_seed(0)
+    B, N, E = 3, 9, 32
+    history = [torch.randn(B, N, E, device=device) for _ in range(4)]
+    depth_res = DepthAttnResidual(d_model=E, layer_norm_eps=1e-5, batch_first=True).to(device)
+    depth_res.eval()
+
+    with torch.no_grad():
+        depth_res.depth_query.zero_()
+        depth_res.depth_scale.fill_(1.0)
+        out = depth_res(history, padding_mask=None)
+        expected = torch.stack(history, dim=1).mean(dim=1)
+        max_abs = float((out - expected).abs().max().item())
+        assert max_abs < 1e-6, f"DepthAttnResidual mean-path mismatch, max_abs_diff={max_abs:.6e}"
+
+        valid_n = 5
+        n_small = 8
+        n_large = 12
+        mask_small = torch.cat(
+            [torch.zeros(B, valid_n, device=device), torch.ones(B, n_small - valid_n, device=device)], dim=1
+        ).to(dtype=torch.bool)
+        mask_large = torch.cat(
+            [torch.zeros(B, valid_n, device=device), torch.ones(B, n_large - valid_n, device=device)], dim=1
+        ).to(dtype=torch.bool)
+        hist_small = [torch.randn(B, n_small, E, device=device) for _ in range(3)]
+        hist_large = [torch.cat([h[:, :valid_n], torch.randn(B, n_large - valid_n, E, device=device)], dim=1) for h in hist_small]
+        out_small = depth_res(hist_small, padding_mask=mask_small)
+        out_large = depth_res(hist_large, padding_mask=mask_large)
+        pad_free_diff = float((out_small[:, :valid_n] - out_large[:, :valid_n]).abs().max().item())
+        assert pad_free_diff < 1e-6, f"DepthAttnResidual padding sensitivity, max_abs_diff={pad_free_diff:.6e}"
 
 
 def _smoke_test_head_gated_mha(device: Optional[str] = None):
